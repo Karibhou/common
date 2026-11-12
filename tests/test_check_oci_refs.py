@@ -445,6 +445,59 @@ class TestTagExistsInGhcr:
 # ---------------------------------------------------------------------------
 
 class TestMain:
+    @pytest.mark.parametrize("early", [False, True])
+    def test_multiple_tags_share_pagination(self, tmp_path, early):
+        (tmp_path / ".github/workflows").mkdir(parents=True)
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs/guide.md").write_text(
+            "".join(f"ghcr.io/projectbluefin/bluefin:{tag}\n"
+                    for tag in ("stable", "latest", "testing"))
+        )
+        pages = [
+            ["stable", "latest", "testing"] if early else ["stable"],
+            ["latest"],
+            ["testing"],
+        ]
+        requests = []
+
+        def urlopen(request, **kwargs):
+            requests.append(request.full_url)
+            page = int(request.full_url.rsplit("=", 1)[1])
+            versions = [{"metadata": {"container": {"tags": pages[page - 1]}}}]
+            versions.extend({} for _ in range(99))
+            response = MagicMock()
+            response.read.return_value = json.dumps(versions).encode()
+            response.__enter__ = lambda s: s
+            response.__exit__ = MagicMock(return_value=False)
+            return response
+
+        with patch("urllib.request.urlopen", side_effect=urlopen):
+            assert main(tmp_path) == 0
+        assert [url.rsplit("=", 1)[1] for url in requests] == (
+            ["1"] if early else ["1", "2", "3"]
+        )
+
+    def test_later_transient_error_preserves_found_tags(self, tmp_path, capsys):
+        (tmp_path / ".github/workflows").mkdir(parents=True)
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs/guide.md").write_text(
+            "ghcr.io/projectbluefin/bluefin:stable\n"
+            "ghcr.io/projectbluefin/bluefin:testing\n"
+        )
+        response = MagicMock()
+        response.read.return_value = json.dumps(
+            [{"metadata": {"container": {"tags": ["stable"]}}}] + [{}] * 99
+        ).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", side_effect=[
+            response, *[urllib.error.URLError("offline")] * 4
+        ]), patch("time.sleep"):
+            assert main(tmp_path) == 0
+        output = capsys.readouterr().out
+        assert "✅ ghcr.io/projectbluefin/bluefin:stable" in output
+        assert "bluefin:testing (skipped, GHCR unreachable)" in output
+
     def test_main_clean_repo_returns_zero(self, tmp_path):
         (tmp_path / ".github/workflows").mkdir(parents=True)
         (tmp_path / "docs").mkdir()
